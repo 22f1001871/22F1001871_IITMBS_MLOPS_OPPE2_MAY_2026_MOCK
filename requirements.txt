@@ -9,3 +9,4 @@ shap
 fairlearn
 matplotlib
 requests
+pytest
