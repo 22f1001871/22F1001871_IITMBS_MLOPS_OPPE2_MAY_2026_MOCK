@@ -1,0 +1,227 @@
+name: Iris MLOps CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+
+env:
+  PROJECT_ID: iitm-mlops-assignments
+  REGION: us-central1
+  REPOSITORY: iris-repo
+  IMAGE_NAME: iris-api
+
+  CLUSTER_NAME: iris-cluster
+  CLUSTER_REGION: us-central1
+
+  IMAGE: us-central1-docker.pkg.dev/iitm-mlops-assignments/iris-repo/iris-api:${{ github.sha }}
+
+
+jobs:
+
+  # ============================================================
+  # CI
+  # ============================================================
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: |
+          pytest -v
+
+
+  # ============================================================
+  # BUILD + LOCAL API TEST + STRESS TEST
+  # ============================================================
+
+  build_and_stress_test:
+    name: Build and Stress Test
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t iris-api:test .
+
+      - name: Start Docker container
+        run: |
+          docker run -d \
+            --name iris-api-test \
+            -p 8000:8000 \
+            iris-api:test
+
+      - name: Wait for API
+        run: |
+          for i in {1..30}; do
+            if curl -f http://localhost:8000/; then
+              echo "API is ready"
+              exit 0
+            fi
+            echo "Waiting for API..."
+            sleep 2
+          done
+
+          echo "API failed to start"
+          docker logs iris-api-test
+          exit 1
+
+      - name: Test prediction API
+        run: |
+          curl -f -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{
+              "sepal_length": 5.1,
+              "sepal_width": 3.5,
+              "petal_length": 1.4,
+              "petal_width": 0.2
+            }'
+
+      - name: Install wrk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wrk
+
+      - name: Create wrk POST script
+        run: |
+          cat > post.lua <<'EOF'
+          wrk.method = "POST"
+
+          wrk.body = [[
+          {
+              "sepal_length": 5.1,
+              "sepal_width": 3.5,
+              "petal_length": 1.4,
+              "petal_width": 0.2
+          }
+          ]]
+
+          wrk.headers["Content-Type"] = "application/json"
+          EOF
+
+      - name: Stress test
+        run: |
+          wrk \
+            -t10 \
+            -c2000 \
+            -d60s \
+            -s post.lua \
+            http://localhost:8000/predict
+
+      - name: Stop test container
+        if: always()
+        run: |
+          docker stop iris-api-test || true
+          docker rm iris-api-test || true
+
+
+  # ============================================================
+  # PUSH IMAGE
+  # ============================================================
+
+  push_image:
+    name: Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build_and_stress_test
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Configure Docker
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev
+
+      - name: Build production image
+        run: |
+          docker build \
+            -t ${{ env.IMAGE }} \
+            .
+
+      - name: Push image
+        run: |
+          docker push ${{ env.IMAGE }}
+
+
+  # ============================================================
+  # CD - DEPLOY TO GKE
+  # ============================================================
+
+  deploy:
+    name: Deploy to GKE
+    runs-on: ubuntu-latest
+    needs: push_image
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.CLUSTER_REGION }}
+
+      - name: Update deployment image
+        run: |
+          kubectl set image deployment/iris-api \
+            iris-api=${{ env.IMAGE }}
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/iris-api \
+            --timeout=300s
+
+      - name: Verify pods
+        run: |
+          kubectl get pods -l app=iris-api
+
+      - name: Verify service
+        run: |
+          kubectl get service iris-api-service
